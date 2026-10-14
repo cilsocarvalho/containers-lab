@@ -13,7 +13,7 @@ jobs:
     if: inputs.operation == 'deploy'
     runs-on: ubuntu-latest
     outputs:
-      image: ${{ steps.image.outputs.uri }}
+      tag: ${{ steps.image.outputs.tag }}
     defaults:
       run:
         working-directory: Lab-03/solution/app
@@ -29,22 +29,25 @@ jobs:
       - name: Image tag
         id: image
         shell: bash
-        run: echo "uri=${{ secrets.DOCKERHUB_USERNAME }}/ci-cd-app:v1.0.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        run: |
+          TAG="v1.0.0-${GITHUB_SHA::7}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/ci-cd-app:$TAG" >> "$GITHUB_ENV"
       - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Docker build
-        run: docker build -t "${{ steps.image.outputs.uri }}" .
+        run: docker build -t "${{ env.IMAGE }}" .
       - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@v0.33.1
-        with:
-          image-ref: ${{ steps.image.outputs.uri }}
-          severity: CRITICAL
-          exit-code: '1'
-          ignore-unfixed: true
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.65.0 image \
+            --exit-code 1 --ignore-unfixed --severity CRITICAL \
+            "$IMAGE"
       - name: Push Docker Hub
-        run: docker push "${{ steps.image.outputs.uri }}"
+        run: docker push "${{ env.IMAGE }}"
   deploy:
     if: always() && (inputs.operation == 'destroy' || needs.build.result == 'success')
     needs: build
@@ -75,11 +78,13 @@ jobs:
         id: task
         shell: bash
         env:
-          IMAGE: ${{ needs.build.outputs.image }}
+          IMAGE_TAG: ${{ needs.build.outputs.tag }}
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           aws logs create-log-group --log-group-name /ecs/ci-cd-app 2>/dev/null || true
           aws logs put-retention-policy --log-group-name /ecs/ci-cd-app --retention-in-days 7
           ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          IMAGE="${DOCKERHUB_USER}/ci-cd-app:${IMAGE_TAG}"
           jq -n --arg image "$IMAGE" --arg role "arn:aws:iam::${ACCOUNT}:role/LabRole" '{
             family:"ci-cd-app",
             networkMode:"awsvpc",
