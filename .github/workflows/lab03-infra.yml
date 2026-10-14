@@ -1,0 +1,64 @@
+name: Lab03 - Infra
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        type: choice
+        options: [apply, destroy]
+        default: apply
+permissions:
+  contents: read
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Lab-03/solution/infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - name: Create state bucket if missing
+        shell: bash
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          echo "TF_BUCKET=${ACCOUNT}-tfstate" >> "$GITHUB_ENV"
+          aws s3api head-bucket --bucket "${ACCOUNT}-tfstate" 2>/dev/null || aws s3api create-bucket --bucket "${ACCOUNT}-tfstate" --region us-east-1
+          aws s3api put-bucket-versioning --bucket "${ACCOUNT}-tfstate" --versioning-configuration Status=Enabled
+          aws s3api put-public-access-block --bucket "${ACCOUNT}-tfstate" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.10.5'
+      - name: Init and validate
+        run: |
+          terraform init -input=false -backend-config="bucket=${TF_BUCKET}" -backend-config="key=lab03/infra.tfstate" -backend-config="region=us-east-1"
+          terraform fmt -recursive
+          terraform validate
+      - uses: terraform-linters/setup-tflint@v4
+      - name: TFLint
+        run: |
+          tflint --init
+          tflint -f compact
+      - uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: Lab-03/solution/infra
+          soft_fail: true
+      - uses: terraform-docs/gh-actions@v1.3.0
+        with:
+          working-dir: Lab-03/solution/infra
+          output-file: TERRAFORM_DOCS.md
+          output-method: replace
+          git-push: 'false'
+      - name: Apply
+        if: inputs.operation == 'apply'
+        run: |
+          terraform plan -out=tfplan
+          terraform apply -auto-approve tfplan
+          terraform output
+      - name: Destroy
+        if: inputs.operation == 'destroy'
+        run: terraform destroy -auto-approve
