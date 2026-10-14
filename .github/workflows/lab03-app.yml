@@ -1,0 +1,124 @@
+name: Lab03 - App
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        type: choice
+        options: [deploy, destroy]
+        default: deploy
+permissions:
+  contents: read
+jobs:
+  build:
+    if: inputs.operation == 'deploy'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.image.outputs.tag }}
+    defaults:
+      run:
+        working-directory: Lab-03/solution/app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test Flask
+        run: |
+          pip install -r requirements.txt
+          python -m unittest discover -v
+      - name: Image tag
+        id: image
+        shell: bash
+        run: |
+          TAG="v1.0.0-${GITHUB_SHA::7}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/ci-cd-app:$TAG" >> "$GITHUB_ENV"
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Docker build
+        run: docker build -t "${{ env.IMAGE }}" .
+      - name: Trivy vulnerability scan
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.65.0 image \
+            --exit-code 1 --ignore-unfixed --severity CRITICAL \
+            "$IMAGE"
+      - name: Push Docker Hub
+        run: docker push "${{ env.IMAGE }}"
+  deploy:
+    if: always() && (inputs.operation == 'destroy' || needs.build.result == 'success')
+    needs: build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Lab-03/solution/deploy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.10.5'
+      - name: Init Terraform
+        shell: bash
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          terraform init -input=false -backend-config="bucket=${ACCOUNT}-tfstate" -backend-config="key=lab03/app.tfstate" -backend-config="region=us-east-1"
+          terraform fmt -recursive
+          terraform validate
+      - name: Configure logs and task definition
+        if: inputs.operation == 'deploy'
+        id: task
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.tag }}
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          aws logs create-log-group --log-group-name /ecs/ci-cd-app 2>/dev/null || true
+          aws logs put-retention-policy --log-group-name /ecs/ci-cd-app --retention-in-days 7
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          IMAGE="${DOCKERHUB_USER}/ci-cd-app:${IMAGE_TAG}"
+          jq -n --arg image "$IMAGE" --arg role "arn:aws:iam::${ACCOUNT}:role/LabRole" '{
+            family:"ci-cd-app",
+            networkMode:"awsvpc",
+            requiresCompatibilities:["FARGATE"],
+            cpu:"512",
+            memory:"1024",
+            taskRoleArn:$role,
+            executionRoleArn:$role,
+            containerDefinitions:[{
+              name:"ci-cd-app",image:$image,essential:true,
+              portMappings:[{containerPort:8000,hostPort:8000,protocol:"tcp"}],
+              logConfiguration:{logDriver:"awslogs",options:{"awslogs-group":"/ecs/ci-cd-app","awslogs-region":"us-east-1","awslogs-stream-prefix":"ecs"}}
+            }]
+          }' > task.json
+          ARN=$(aws ecs register-task-definition --cli-input-json file://task.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+      - name: Deploy ECS service
+        if: inputs.operation == 'deploy'
+        env:
+          TF_VAR_task_definition_arn: ${{ steps.task.outputs.arn }}
+        run: |
+          terraform plan -out=tfplan
+          terraform apply -auto-approve tfplan
+      - name: Verify running service
+        if: inputs.operation == 'deploy'
+        shell: bash
+        run: |
+          aws ecs wait services-stable --cluster app-prod-cluster --services app-service
+          aws ecs describe-services --cluster app-prod-cluster --services app-service --query 'services[0].[runningCount,desiredCount]' --output table
+          DNS=$(aws elbv2 describe-load-balancers --names app-prod-nlb --query 'LoadBalancers[0].DNSName' --output text)
+          echo "Application: http://$DNS"
+          curl --fail --retry 10 --retry-delay 5 "http://$DNS/health"
+      - name: Destroy service
+        if: inputs.operation == 'destroy'
+        env:
+          TF_VAR_task_definition_arn: placeholder
+        run: terraform destroy -auto-approve
